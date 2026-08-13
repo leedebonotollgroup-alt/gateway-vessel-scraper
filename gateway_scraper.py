@@ -1,143 +1,167 @@
+from datetime import datetime
+import importlib
 import os
 import re
+import site
 import sqlite3
-import pandas as pd
-from datetime import datetime
+import sys
+import time
+
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
+import pandas as pd
+from playwright.sync_api import sync_playwright
 
-# --- Configuration ---
-GATEWAY_URL = "https://www.gatewaycontainerline.com.au/schedule"
-DB_FILE = "gateway_vessel_schedule.db"
-EXCEL_OUTPUT = "Gateway_Vessel_Schedule.xlsx"
+# ---------------------------------------------------------------------------
+# 1. CONFIGURATION & ENVIRONMENT VARIABLES
+# ---------------------------------------------------------------------------
+LOGIN_URL = "https://gateway.1-stop.biz/"
+SEARCH_URL = (
+    "https://gateway.1-stop.biz/VesselSchedule/SearchAdvanced"
+    "?searchAction=search&PortOfCall=AUMEL&Terminals=&VesselName="
+    "&LineOperator=&LloydsNumber=&SubmitSearchCriteria=Search"
+)
 
-# Environment Variables for Security
+# Pull credentials from environment variables (used by GitHub Actions Secrets)
 GATEWAY_USERNAME = os.getenv("GATEWAY_USERNAME", "leede")
 GATEWAY_PASSWORD = os.getenv("GATEWAY_PASSWORD", "8g*HL#TJkZRYe?4")
 
+# Detect CI/Cloud Environment (GitHub Actions sets CI=true)
+IS_CI = os.getenv("CI", "false").lower() == "true"
 
-def clean_text(text):
-    """Utility to clean up scraped string content."""
-    if not text:
-        return ""
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+DB_FILE = "gateway_vessel_schedule.db"
+EXCEL_OUTPUT = "Gateway_Vessel_Schedule.xlsx"
+PROFILE_DIR = os.path.abspath("./gateway_playwright_profile")
 
+REAL_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
 
-def parse_datetime(date_str):
-    """Parses various date/time formats into pandas datetime objects."""
-    if not date_str or date_str in ["-", "N/A", "TBA", ""]:
+# ---------------------------------------------------------------------------
+# 2. HELPER FUNCTIONS
+# ---------------------------------------------------------------------------
+def parse_gateway_datetime(val):
+    """
+    Parses date strings like '04 Oct03:05', '04 Oct 03:05', or '12 Feb16:24'
+    into actual Python datetime objects for Excel formatting.
+    """
+    if not val or pd.isna(val):
         return pd.NaT
 
-    date_str = clean_text(date_str)
+    val = str(val).strip()
+    if not val or val in ["-", "N/A", "TBA"]:
+        return pd.NaT
 
-    formats = [
-        "%d/%m/%Y %H:%M",
-        "%d/%m/%Y %H:%M:%S",
-        "%d/%m/%Y",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-    ]
+    clean_val = re.sub(r"([a-zA-Z]{3})\s*(\d{2}:\d{2})", r"\1 \2", val)
+    clean_val = re.sub(r"\s+", " ", clean_val)
 
-    for fmt in formats:
-        try:
-            return pd.to_datetime(date_str, format=fmt)
-        except (ValueError, TypeError):
-            continue
+    curr_year = datetime.now().year
 
-    return pd.to_datetime(date_str, errors="coerce")
+    try:
+        return datetime.strptime(f"{clean_val} {curr_year}", "%d %b %H:%M %Y")
+    except ValueError:
+        pass
+
+    try:
+        return datetime.strptime(f"{clean_val} {curr_year}", "%d %b %Y")
+    except ValueError:
+        pass
+
+    return pd.NaT
 
 
-def extract_gateway_schedule():
-    """Logs into Gateway using Playwright and extracts the vessel schedule table."""
-    print("Starting Playwright browser...")
+def perform_login(page):
+    """Executes authentication on the Gateway portal."""
+    print(f"Navigating to login page: {LOGIN_URL}...")
+    page.goto(LOGIN_URL)
+    page.wait_for_timeout(2000)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = context.new_page()
+    if "SignIn" not in page.url and page.locator("#logOnSubmitBtn").count() == 0:
+        print("Already authenticated or redirected.")
+        return
 
-        print(f"Navigating to Gateway Schedule page: {GATEWAY_URL}")
-        page.goto(GATEWAY_URL, wait_until="networkidle")
+    print("Filling credentials...")
+    user_input = page.locator(
+        "#username, input[name='username'], input[type='email'], input[name*='user' i]"
+    ).first
+    user_input.fill(GATEWAY_USERNAME)
 
-        # Check for login inputs
-        username_input = page.query_selector(
-            "input[name='username'], input[name='user'], input[type='text']"
-        )
-        password_input = page.query_selector(
-            "input[name='password'], input[type='password']"
-        )
+    pass_input = page.locator("#password, input[type='password']").first
+    pass_input.fill(GATEWAY_PASSWORD)
 
-        if username_input and password_input:
-            print("Login fields detected. Authenticating...")
-            username_input.fill(GATEWAY_USERNAME)
-            password_input.fill(GATEWAY_PASSWORD)
+    page.wait_for_timeout(500)
 
-            submit_btn = page.query_selector(
-                "input[type='submit'], button[type='submit'], button:has-text('Login')"
-            )
-            if submit_btn:
-                submit_btn.click()
-            else:
-                page.keyboard.press("Enter")
+    print("Submitting login...")
+    if page.locator("#logOnSubmitBtn").count() > 0:
+        page.click("#logOnSubmitBtn")
+    else:
+        page.keyboard.press("Enter")
 
-            page.wait_for_load_state("networkidle")
-            print("Authentication complete.")
+    print("Waiting for session initialization...")
+    page.wait_for_timeout(5000)
 
-        # Ensure page content loaded
-        page.wait_for_timeout(3000)
-        html_content = page.content()
-        browser.close()
 
-    print("Parsing page HTML with BeautifulSoup...")
-    soup = BeautifulSoup(html_content, "html.parser")
+def extract_gateway_schedule(page):
+    """Navigates to the search URL and parses table #searchResult."""
+    print(f"Navigating to Gateway Schedule Search URL...\n{SEARCH_URL}")
+    page.goto(SEARCH_URL)
+    page.wait_for_timeout(4000)
 
-    table = soup.find("table")
-    if not table:
-        print(
-            "Warning: No table element found on the schedule page. Retrying generic table search..."
-        )
-        tables = soup.find_all("table")
-        if tables:
-            table = tables[0]
-        else:
-            print("Error: Could not locate vessel schedule table.")
-            return pd.DataFrame()
+    if "Just a moment" in page.title() or "challenge" in page.content().lower():
+        print("Cloudflare verification detected. Waiting 10 seconds...")
+        page.wait_for_timeout(10000)
 
-    headers = []
-    header_row = table.find("tr")
-    if header_row:
-        headers = [
-            clean_text(th.get_text())
-            for th in header_row.find_all(["th", "td"])
-            if clean_text(th.get_text())
-        ]
+    if "SignIn" in page.url or page.locator("#logOnSubmitBtn").count() > 0:
+        print("Session expired. Re-authenticating...")
+        perform_login(page)
+        page.goto(SEARCH_URL)
+        page.wait_for_timeout(4000)
 
-    rows = []
-    for tr in table.find_all("tr")[1:]:
-        cells = [clean_text(td.get_text()) for td in tr.find_all("td")]
-        if cells and len(cells) >= 3:
-            rows.append(cells)
+    print("Locating schedule table '#searchResult'...")
+    table_html = None
 
-    if not rows:
-        print("Error: No data rows extracted from schedule table.")
+    for _ in range(15):
+        for scope in [page] + page.frames:
+            try:
+                locator = scope.locator("#searchResult")
+                if locator.count() > 0 and locator.first.is_visible():
+                    table_html = locator.first.evaluate("el => el.outerHTML")
+                    break
+            except Exception:
+                pass
+        if table_html:
+            break
+        page.wait_for_timeout(1000)
+
+    if not table_html:
+        print("Fallback: Extracting full page content for HTML parsing...")
+        table_html = page.content()
+
+    soup = BeautifulSoup(table_html, "html.parser")
+    target_table = soup.find("table", id="searchResult") or soup.find("table")
+
+    if not target_table:
+        print("ERROR: Could not locate table on page.")
         return pd.DataFrame()
 
-    # Determine column mapping dynamically or use default schema
-    if headers and len(headers) == len(rows[0]):
-        df = pd.DataFrame(rows, columns=headers)
-    else:
-        default_cols = [
-            "Facility",
+    headers = []
+    thead = target_table.find("thead")
+    if thead:
+        for th in thead.find_all("th"):
+            text = th.get_text(" ", strip=True)
+            if text:
+                headers.append(text)
+
+    if not headers:
+        headers = [
+            "Port or Terminal",
             "Vessel",
-            "Voyage",
             "Lloyds Number",
-            "Service",
+            "In Voyage",
+            "Out Voyage",
             "ETA",
             "ETD",
             "Export Receive Start",
@@ -150,40 +174,46 @@ def extract_gateway_schedule():
             "First Avail.",
             "First Free",
             "Import Storage Start",
-            "Status",
+            "Berth",
+            "Line",
+            "Route",
         ]
-        if len(rows[0]) == len(default_cols):
-            df = pd.DataFrame(rows, columns=default_cols)
-        else:
-            df = pd.DataFrame(rows)
 
-    # Standardize Column Names
-    col_rename = {}
-    for col in df.columns:
-        c_lower = str(col).lower()
-        if "lloyd" in c_lower or "imo" in c_lower:
-            col_rename[col] = "Lloyds Number"
-        elif "vessel" in c_lower:
-            col_rename[col] = "Vessel"
-        elif "voyage" in c_lower:
-            col_rename[col] = "Voyage"
-        elif "eta" in c_lower:
-            col_rename[col] = "ETA"
-        elif "etd" in c_lower:
-            col_rename[col] = "ETD"
+    rows = []
+    tbody = target_table.find("tbody")
+    row_elements = (
+        tbody.find_all("tr")
+        if tbody
+        else target_table.find_all("tr", class_=["gridrow", "gridrow_alternate"])
+    )
 
-    df = df.rename(columns=col_rename)
+    for tr in row_elements:
+        cells = []
+        for td in tr.find_all("td"):
+            for br in td.find_all("br"):
+                br.replace_with(" ")
+            cell_text = td.get_text(strip=True)
+            cells.append(cell_text)
 
-    # Clean Lloyds Number Column
+        if cells:
+            if len(cells) > len(headers):
+                cells = cells[: len(headers)]
+            elif len(cells) < len(headers):
+                cells += [""] * (len(headers) - len(cells))
+            rows.append(cells)
+
+    df = pd.DataFrame(rows, columns=headers[: len(rows[0])] if rows else None)
+
+    if "Vessel" in df.columns:
+        df = df[df["Vessel"].astype(str).str.strip() != ""]
+
     if "Lloyds Number" in df.columns:
         df["Lloyds Number"] = (
             df["Lloyds Number"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
         )
     else:
-        print("Warning: 'Lloyds Number' column not found. Creating empty column for key tracking.")
         df["Lloyds Number"] = ""
 
-    # Parse DateTime Columns
     datetime_cols = [
         "ETA",
         "ETD",
@@ -201,11 +231,11 @@ def extract_gateway_schedule():
 
     for col in datetime_cols:
         if col in df.columns:
-            df[col] = df[col].apply(parse_datetime)
+            df[col] = df[col].apply(parse_gateway_datetime)
 
     df["Scrape Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    print(f"Successfully scraped {len(df)} records from Gateway.")
+    print(f"Successfully extracted {len(df)} records.")
     return df
 
 
@@ -231,11 +261,10 @@ def merge_with_historical_data(df_new):
 
         print(f"Found {len(df_old)} existing historical records in database.")
 
-        # Ensure Lloyds Numbers are string types for clean comparison
         df_new["Lloyds Number"] = df_new["Lloyds Number"].astype(str).str.strip()
         df_old["Lloyds Number"] = df_old["Lloyds Number"].astype(str).str.strip()
 
-        # Extract set of non-empty Lloyds Numbers from the new scrape batch
+        # Extract set of non-empty Lloyds Numbers from the new batch
         new_lloyds = set(df_new[df_new["Lloyds Number"] != ""]["Lloyds Number"])
 
         # Retain old records whose Lloyds Numbers are NOT in the new batch
@@ -244,7 +273,6 @@ def merge_with_historical_data(df_new):
         # Combine old retained records with all new records
         df_combined = pd.concat([df_old_retained, df_new], ignore_index=True)
 
-        # Convert date columns back to proper datetime objects after DB read
         datetime_cols = [
             "ETA",
             "ETD",
@@ -264,14 +292,13 @@ def merge_with_historical_data(df_new):
                 df_combined[col] = pd.to_datetime(df_combined[col], errors="coerce")
 
         print(
-            f"Historical Merge Complete: Preserved {len(df_old_retained)} old records, updated/added {len(df_new)} records (Total: {len(df_combined)} rows)."
+            f"Historical Merge Complete: Preserved {len(df_old_retained)} old records, "
+            f"updated/added {len(df_new)} records (Total: {len(df_combined)} rows)."
         )
         return df_combined
 
     except Exception as e:
-        print(
-            f"Warning: Could not read existing database for merge ({e}). Proceeding with current scrape only."
-        )
+        print(f"Warning: Could not read existing database for merge ({e}). Proceeding with current scrape only.")
         return df_new
 
 
@@ -281,16 +308,12 @@ def export_to_excel_and_sqlite(df_new):
         print("No data extracted. Skipping export.")
         return
 
-    # Merge with existing historical data before saving
     df_final = merge_with_historical_data(df_new)
 
     print(f"\n1. Saving {len(df_final)} total records to SQLite database: {DB_FILE}...")
-
-    # Write to SQLite Database
     conn = sqlite3.connect(DB_FILE)
     df_to_sql = df_final.copy()
-    
-    # Format datetime columns as ISO strings for SQLite compatibility
+
     for col in df_to_sql.select_dtypes(include=["datetime64[ns]", "datetime64"]):
         df_to_sql[col] = df_to_sql[col].dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -313,7 +336,6 @@ def export_to_excel_and_sqlite(df_new):
         max_col = len(df_final.columns)
         col_letter = get_column_letter(max_col)
 
-        # Apply Native Excel Table Formatting
         tab_range = f"A1:{col_letter}{max_row}"
         table = Table(displayName="GatewayVesselScheduleList", ref=tab_range)
         table.tableStyleInfo = TableStyleInfo(
@@ -321,7 +343,6 @@ def export_to_excel_and_sqlite(df_new):
         )
         ws.add_table(table)
 
-        # Auto-adjust column widths
         for col in ws.columns:
             max_len = 0
             for cell in col:
@@ -337,15 +358,52 @@ def export_to_excel_and_sqlite(df_new):
     print(f"\nSUCCESS: Exported {len(df_final)} historical and current rows to Excel and SQLite!")
 
 
-def main():
-    """Main execution function."""
-    print("=" * 60)
-    print("Gateway Container Line Schedule Scraper - Historical Upsert Mode")
-    print("=" * 60)
+def run():
+    print(f"Starting Playwright Context (Headless Mode = {IS_CI})...")
+    with sync_playwright() as p:
+        stealth_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--no-first-run",
+        ]
 
-    df_new = extract_gateway_schedule()
-    export_to_excel_and_sqlite(df_new)
+        try:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=PROFILE_DIR,
+                headless=IS_CI,
+                user_agent=REAL_USER_AGENT,
+                viewport={"width": 1400, "height": 900},
+                ignore_default_args=["--enable-automation"],
+                args=stealth_args,
+            )
+        except Exception:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=PROFILE_DIR,
+                headless=IS_CI,
+                user_agent=REAL_USER_AGENT,
+                viewport={"width": 1400, "height": 900},
+                ignore_default_args=["--enable-automation"],
+                args=stealth_args,
+            )
+
+        page = context.pages[0] if context.pages else context.new_page()
+
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
+
+        perform_login(page)
+        df_schedule = extract_gateway_schedule(page)
+        export_to_excel_and_sqlite(df_schedule)
+
+        context.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        run()
+    except Exception as e:
+        print(f"\nAN ERROR OCCURRED: {e}")

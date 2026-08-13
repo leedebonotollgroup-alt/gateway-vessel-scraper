@@ -214,6 +214,11 @@ def extract_gateway_schedule(page):
     else:
         df["Lloyds Number"] = ""
 
+    if "In Voyage" in df.columns:
+        df["In Voyage"] = df["In Voyage"].astype(str).str.strip()
+    else:
+        df["In Voyage"] = ""
+
     datetime_cols = [
         "ETA",
         "ETD",
@@ -241,8 +246,9 @@ def extract_gateway_schedule(page):
 
 def merge_with_historical_data(df_new):
     """
-    Merges newly scraped records with existing database records based on 'Lloyds Number'.
-    Preserves historical records while overwriting matching Lloyds Numbers with fresh data.
+    Merges newly scraped records with existing database records based on
+    a composite key of ('Lloyds Number' AND 'In Voyage').
+    Preserves historical records while overwriting matching voyages with fresh data.
     """
     if df_new.empty:
         return df_new
@@ -261,17 +267,35 @@ def merge_with_historical_data(df_new):
 
         print(f"Found {len(df_old)} existing historical records in database.")
 
-        df_new["Lloyds Number"] = df_new["Lloyds Number"].astype(str).str.strip()
-        df_old["Lloyds Number"] = df_old["Lloyds Number"].astype(str).str.strip()
+        # Ensure matching key columns are string types and cleaned
+        for frame in [df_new, df_old]:
+            if "Lloyds Number" in frame.columns:
+                frame["Lloyds Number"] = frame["Lloyds Number"].astype(str).str.strip()
+            else:
+                frame["Lloyds Number"] = ""
 
-        # Extract set of non-empty Lloyds Numbers from the new batch
-        new_lloyds = set(df_new[df_new["Lloyds Number"] != ""]["Lloyds Number"])
+            if "In Voyage" in frame.columns:
+                frame["In Voyage"] = frame["In Voyage"].astype(str).str.strip()
+            else:
+                frame["In Voyage"] = ""
 
-        # Retain old records whose Lloyds Numbers are NOT in the new batch
-        df_old_retained = df_old[~df_old["Lloyds Number"].isin(new_lloyds)]
+        # Create composite matching key: 'Lloyds Number' + '|' + 'In Voyage'
+        df_new["_composite_key"] = df_new["Lloyds Number"] + "|" + df_new["In Voyage"]
+        df_old["_composite_key"] = df_old["Lloyds Number"] + "|" + df_old["In Voyage"]
+
+        # Extract set of non-empty composite keys from new scrape batch
+        new_keys = set(df_new[df_new["_composite_key"] != "|"]["_composite_key"])
+
+        # Retain old records whose composite keys are NOT in the new batch
+        df_old_retained = df_old[~df_old["_composite_key"].isin(new_keys)].copy()
 
         # Combine old retained records with all new records
         df_combined = pd.concat([df_old_retained, df_new], ignore_index=True)
+
+        # Drop temporary composite key
+        df_combined.drop(columns=["_composite_key"], inplace=True, errors="ignore")
+        if "_composite_key" in df_new.columns:
+            df_new.drop(columns=["_composite_key"], inplace=True)
 
         datetime_cols = [
             "ETA",
@@ -292,8 +316,8 @@ def merge_with_historical_data(df_new):
                 df_combined[col] = pd.to_datetime(df_combined[col], errors="coerce")
 
         print(
-            f"Historical Merge Complete: Preserved {len(df_old_retained)} old records, "
-            f"updated/added {len(df_new)} records (Total: {len(df_combined)} rows)."
+            f"Historical Merge Complete (Key: Lloyds Number + In Voyage): "
+            f"Preserved {len(df_old_retained)} old records, updated/added {len(df_new)} records (Total: {len(df_combined)} rows)."
         )
         return df_combined
 

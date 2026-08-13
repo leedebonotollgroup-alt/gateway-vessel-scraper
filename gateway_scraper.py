@@ -239,7 +239,7 @@ def extract_gateway_schedule(page):
         if col in df.columns:
             df[col] = df[col].apply(parse_gateway_datetime)
 
-    # Scrape Timestamp adjusted to Australian Eastern Time (AEST/AEDT)
+    # Updated: Set timestamp to Australian time (AEST/AEDT)
     aest_now = datetime.now(ZoneInfo("Australia/Melbourne"))
     df["Scrape Timestamp"] = aest_now.strftime("%Y-%m-%d %H:%M:%S")
 

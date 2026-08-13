@@ -1,0 +1,43 @@
+name: Gateway Vessel Schedule Scraper
+
+on:
+  schedule:
+    # Runs daily at 20:00 UTC (6:00 AM AEST)
+    - cron: '0 20 * * *'
+  workflow_dispatch: # Enables manual run button in GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl playwright beautifulsoup4
+
+      - name: Install Playwright Browsers
+        run: |
+          npx playwright install chromium --with-deps
+
+      - name: Run Scraper Script
+        env:
+          GATEWAY_USERNAME: ${{ secrets.GATEWAY_USERNAME }}
+          GATEWAY_PASSWORD: ${{ secrets.GATEWAY_PASSWORD }}
+        run: |
+          python gateway_scraper.py
+
+      - name: Upload Excel Output as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gateway_Vessel_Schedule
+          path: Gateway_Vessel_Schedule.xlsx
+          retention-days: 14

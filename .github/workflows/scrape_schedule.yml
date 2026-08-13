@@ -4,11 +4,14 @@ on:
   schedule:
     # Runs daily at 20:00 UTC (6:00 AM AEST)
     - cron: '0 20 * * *'
-  workflow_dispatch: # Enables manual run button in GitHub UI
+  workflow_dispatch: # Enables manual "Run workflow" button in GitHub Actions UI
 
 jobs:
-  scrape:
+  scrape-and-sync:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # Grants permission to commit database and excel changes back to repo
 
     steps:
       - name: Check out repository
@@ -22,9 +25,9 @@ jobs:
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
-          pip install pandas openpyxl playwright beautifulsoup4
+          pip install pandas openpyxl playwright beautifulsoup4 requests
 
-      - name: Install Playwright Browsers
+      - name: Install Playwright Browsers with System Dependencies
         run: |
           npx playwright install chromium --with-deps
 
@@ -32,10 +35,50 @@ jobs:
         env:
           GATEWAY_USERNAME: ${{ secrets.GATEWAY_USERNAME }}
           GATEWAY_PASSWORD: ${{ secrets.GATEWAY_PASSWORD }}
+          CI: 'true'
         run: |
           python gateway_scraper.py
 
-      - name: Upload Excel Output as Artifact
+      - name: Commit Updated Database & Excel Back to GitHub
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add gateway_vessel_schedule.db Gateway_Vessel_Schedule.xlsx
+          git commit -m "Auto-update historical schedule database and Excel [skip ci]" || echo "No changes to commit"
+          git push
+
+      - name: Send Updated Excel to SharePoint via Power Automate Webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.SHAREPOINT_WEBHOOK_URL }}
+        run: |
+          python -c "
+          import os, requests, base64
+
+          url = os.getenv('WEBHOOK_URL')
+          file_path = 'Gateway_Vessel_Schedule.xlsx'
+
+          if not url:
+              print('SHAREPOINT_WEBHOOK_URL secret is not set. Skipping SharePoint upload.')
+          elif not os.path.exists(file_path):
+              print('Output file Gateway_Vessel_Schedule.xlsx not found. Skipping SharePoint upload.')
+          else:
+              with open(file_path, 'rb') as f:
+                  encoded_content = base64.b64encode(f.read()).decode('utf-8')
+
+              payload = {
+                  'fileName': file_path,
+                  'fileContent': encoded_content
+              }
+              
+              res = requests.post(url, json=payload)
+              print(f'SharePoint Webhook Response Code: {res.status_code}')
+              if res.status_code in [200, 202]:
+                  print('SUCCESS: File delivered to Power Automate for SharePoint upload.')
+              else:
+                  print(f'WARNING: Power Automate returned non-success response: {res.text}')
+          "
+
+      - name: Upload Excel Output as GitHub Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Gateway_Vessel_Schedule

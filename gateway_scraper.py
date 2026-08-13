@@ -1,4 +1,5 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import importlib
 import os
 import re
@@ -238,7 +239,9 @@ def extract_gateway_schedule(page):
         if col in df.columns:
             df[col] = df[col].apply(parse_gateway_datetime)
 
-    df["Scrape Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Scrape Timestamp adjusted to Australian Eastern Time (AEST/AEDT)
+    aest_now = datetime.now(ZoneInfo("Australia/Melbourne"))
+    df["Scrape Timestamp"] = aest_now.strftime("%Y-%m-%d %H:%M:%S")
 
     print(f"Successfully extracted {len(df)} records.")
     return df
